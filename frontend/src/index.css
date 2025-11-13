@@ -1,1 +1,17 @@
 @import "tailwindcss";
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color:  bg-slate-950;
+  color: text-slate-100;
+  font-family: "Inter", "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  min-height: 100vh;
+}
+
+::selection {
+  background-color: bg-sky-400/40; 
+  color: text-white;
+}
