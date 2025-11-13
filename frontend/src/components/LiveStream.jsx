@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { io } from "socket.io-client";
 import VideoFeed from "./VideoFeed";
 import DetectionsPanel from "./DetectionsPanel";
 import MessagesPanel from "./MessagesPanel";
 
-const DEFAULT_WS_URL = import.meta.env.VITE_POTHOLE_WS_URL ?? "ws://localhost:5000/ws";
-const FRAME_INTERVAL_MS = 300;
+const DEFAULT_SOCKET_URL = import.meta.env.VITE_POTHOLE_WS_URL ?? "http://localhost:5000";
+const FRAME_INTERVAL_MS = 500;
 
 const statusPills = {
   idle: {
@@ -53,14 +54,14 @@ const normalizeBox = (box, width, height) => {
   };
 };
 
-export function LiveStream({ showToast, wsUrl = DEFAULT_WS_URL, onStateUpdate }) {
+export function LiveStream({ showToast, wsUrl = DEFAULT_SOCKET_URL, onStateUpdate }) {
   const userVideoRef = useRef(null);
   const processedVideoRef = useRef(null);
   const userOverlayCanvasRef = useRef(null);
   const processedOverlayCanvasRef = useRef(null);
   const captureCanvasRef = useRef(null);
   const streamRef = useRef(null);
-  const websocketRef = useRef(null);
+  const socketRef = useRef(null);
   const frameTimerRef = useRef(null);
 
   const [cameraState, setCameraState] = useState("idle");
@@ -72,6 +73,7 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_WS_URL, onStateUpdate })
   const [speedCue, setSpeedCue] = useState(null);
   const [processedFrameUrl, setProcessedFrameUrl] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [command, setCommand] = useState("");
 
   const isLive = cameraState === "active" && socketState === "active";
 
@@ -85,9 +87,9 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_WS_URL, onStateUpdate })
   const stopStreaming = useCallback(() => {
     clearTimer();
 
-    if (websocketRef.current) {
-      websocketRef.current.close();
-      websocketRef.current = null;
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+      socketRef.current = null;
     }
 
     if (streamRef.current) {
@@ -107,12 +109,13 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_WS_URL, onStateUpdate })
     setSpeedCue(null);
     setProcessedFrameUrl(null);
     setMessages([]);
+    setCommand("");
   }, [clearTimer]);
 
   const sendFrame = useCallback(() => {
     const video = userVideoRef.current;
-    const ws = websocketRef.current;
-    if (!video || !ws || ws.readyState !== WebSocket.OPEN) {
+    const socket = socketRef.current;
+    if (!video || !socket || !socket.connected) {
       return;
     }
 
@@ -128,31 +131,15 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_WS_URL, onStateUpdate })
       canvas.height = height;
     }
 
-    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const ctx = canvas.getContext("2d");
     ctx.drawImage(video, 0, 0, width, height);
-
-    canvas.toBlob(
-      (blob) => {
-        if (!blob || ws.readyState !== WebSocket.OPEN) return;
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          try {
-            ws.send(
-              JSON.stringify({
-                type: "frame",
-                timestamp: Date.now(),
-                data: reader.result,
-              })
-            );
-          } catch (error) {
-            console.error("Failed to send frame", error);
-          }
-        };
-        reader.readAsDataURL(blob);
-      },
-      "image/jpeg",
-      0.7
-    );
+    
+    try {
+      const dataUrl = canvas.toDataURL("image/jpeg");
+      socket.emit("frame", dataUrl);
+    } catch (error) {
+      console.error("Failed to send frame", error);
+    }
   }, []);
 
   const drawDetections = useCallback(
@@ -200,21 +187,35 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_WS_URL, onStateUpdate })
     []
   );
 
-  const handleSocketMessage = useCallback(
-    (event) => {
+  const handleProcessedData = useCallback(
+    (data) => {
       try {
-        const payload = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
-        if (!payload) return;
-
-        // Handle processed frame/image from backend
-        if (payload.type === "processed_frame" && payload.data) {
-          setProcessedFrameUrl(payload.data);
+        // Handle processed frame and command from Socket.IO "processed" event
+        if (data.frame) {
+          setProcessedFrameUrl(data.frame);
         }
 
-        const boxes = Array.isArray(payload.boxes)
-          ? payload.boxes
-          : Array.isArray(payload.detections)
-          ? payload.detections
+        if (data.command) {
+          setCommand(data.command);
+          setHeroAlert(data.command);
+          
+          // Add command to messages
+          setMessages((prev) => [
+            {
+              id: Date.now(),
+              message: data.command,
+              type: "alert",
+              timestamp: new Date().toISOString(),
+            },
+            ...prev.slice(0, 9),
+          ]);
+        }
+
+        // Handle detections if present
+        const boxes = Array.isArray(data.boxes)
+          ? data.boxes
+          : Array.isArray(data.detections)
+          ? data.detections
           : [];
 
         const video = userVideoRef.current;
@@ -234,85 +235,59 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_WS_URL, onStateUpdate })
           drawDetections([], processedOverlayCanvasRef, processedVideoRef);
         }
 
-        const rawDirection = payload.direction ?? payload.position ?? payload.lane ?? null;
+        // Handle direction and speed cues if present
+        const rawDirection = data.direction ?? data.position ?? data.lane ?? null;
         const normalizedDirection = typeof rawDirection === "string" ? rawDirection.toLowerCase() : null;
-        const rawSpeed = payload.speedCue ?? payload.speed ?? payload.action ?? null;
+        const rawSpeed = data.speedCue ?? data.speed ?? data.action ?? null;
         const normalizedSpeed = typeof rawSpeed === "string" && rawSpeed.toLowerCase().includes("slow") ? "slow" : null;
 
-        setDirectionCue(normalizedDirection);
-        setSpeedCue(normalizedSpeed);
-
-        const alertText =
-          payload.alert ??
-          payload.message ??
-          payload.commentary ??
-          (normalizedDirection === "left"
-            ? "Pothole on left — steer right"
-            : normalizedDirection === "right"
-            ? "Pothole on right — steer left"
-            : normalizedDirection === "center"
-            ? "Obstacle ahead"
-            : normalizedSpeed === "slow"
-            ? "Reduce speed — rough surface ahead"
-            : null);
-
-        if (alertText) {
-          setHeroAlert(alertText);
-          setMessages((prev) => [
-            {
-              id: Date.now(),
-              message: alertText,
-              type: normalizedDirection ? "direction" : normalizedSpeed ? "speed" : "alert",
-              direction: normalizedDirection,
-              timestamp: new Date().toISOString(),
-            },
-            ...prev.slice(0, 9),
-          ]);
-        }
+        if (normalizedDirection) setDirectionCue(normalizedDirection);
+        if (normalizedSpeed) setSpeedCue(normalizedSpeed);
       } catch (error) {
-        console.error("Unable to parse WebSocket message", error);
+        console.error("Unable to parse processed data", error);
       }
     },
     [drawDetections]
   );
 
-  const initializeWebSocket = useCallback(
+  const initializeSocket = useCallback(
     (url) => {
       try {
-        const ws = new WebSocket(url);
         setSocketState("connecting");
+        const socket = io(url);
 
-        ws.onopen = () => {
+        socket.on("connect", () => {
+          console.log("Connected to Flask backend");
           setSocketState("active");
           clearTimer();
           frameTimerRef.current = setInterval(sendFrame, FRAME_INTERVAL_MS);
-          showToast?.({ message: "Live WebSocket connected", tone: "success" });
-        };
+          showToast?.({ message: "Live Socket.IO connected", tone: "success" });
+        });
 
-        ws.onmessage = handleSocketMessage;
+        socket.on("processed", handleProcessedData);
 
-        ws.onerror = (event) => {
-          console.error("WebSocket error", event);
-          setSocketState("error");
-          showToast?.({ message: "WebSocket error. Check backend logs.", tone: "error" });
-        };
-
-        ws.onclose = () => {
+        socket.on("disconnect", () => {
           clearTimer();
           setSocketState("idle");
           if (cameraState === "active") {
-            showToast?.({ message: "WebSocket closed", tone: "warning" });
+            showToast?.({ message: "Socket.IO disconnected", tone: "warning" });
           }
-        };
+        });
 
-        websocketRef.current = ws;
+        socket.on("connect_error", (error) => {
+          console.error("Socket.IO connection error", error);
+          setSocketState("error");
+          showToast?.({ message: "Socket.IO connection error. Check backend logs.", tone: "error" });
+        });
+
+        socketRef.current = socket;
       } catch (error) {
-        console.error("Failed to initialize WebSocket", error);
+        console.error("Failed to initialize Socket.IO", error);
         setSocketState("error");
-        showToast?.({ message: "Unable to connect to WebSocket endpoint", tone: "error" });
+        showToast?.({ message: "Unable to connect to Socket.IO endpoint", tone: "error" });
       }
     },
-    [cameraState, clearTimer, handleSocketMessage, sendFrame, showToast]
+    [cameraState, clearTimer, handleProcessedData, sendFrame, showToast]
   );
 
   const requestCamera = useCallback(async () => {
@@ -349,8 +324,8 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_WS_URL, onStateUpdate })
     const hasCamera = await requestCamera();
     if (!hasCamera) return;
 
-    initializeWebSocket(socketUrl);
-  }, [cameraState, initializeWebSocket, requestCamera, socketState, socketUrl]);
+    initializeSocket(socketUrl);
+  }, [cameraState, initializeSocket, requestCamera, socketState, socketUrl]);
 
   useEffect(() => () => stopStreaming(), [stopStreaming]);
 
@@ -412,7 +387,7 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_WS_URL, onStateUpdate })
                 />
                 <span className="relative inline-flex h-2 w-2 rounded-full bg-current" />
               </span>
-              WebSocket {socketPill.label}
+              Socket.IO {socketPill.label}
             </span>
           </div>
           <div className="flex flex-wrap gap-3">
