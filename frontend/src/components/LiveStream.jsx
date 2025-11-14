@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import VideoFeed from "./VideoFeed";
-import DetectionsPanel from "./DetectionsPanel";
-import MessagesPanel from "./MessagesPanel";
 
 const DEFAULT_SOCKET_URL = import.meta.env.VITE_POTHOLE_WS_URL ?? "http://localhost:5000";
 const FRAME_INTERVAL_MS = 500;
@@ -63,6 +61,7 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_SOCKET_URL, onStateUpdat
   const streamRef = useRef(null);
   const socketRef = useRef(null);
   const frameTimerRef = useRef(null);
+  const signTimeoutRef = useRef(null);
 
   const [cameraState, setCameraState] = useState("idle");
   const [socketState, setSocketState] = useState("idle");
@@ -72,8 +71,8 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_SOCKET_URL, onStateUpdat
   const [directionCue, setDirectionCue] = useState(null);
   const [speedCue, setSpeedCue] = useState(null);
   const [processedFrameUrl, setProcessedFrameUrl] = useState(null);
-  const [messages, setMessages] = useState([]);
   const [command, setCommand] = useState("");
+  const [activeSign, setActiveSign] = useState(null);
 
   const isLive = cameraState === "active" && socketState === "active";
 
@@ -108,8 +107,12 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_SOCKET_URL, onStateUpdat
     setDirectionCue(null);
     setSpeedCue(null);
     setProcessedFrameUrl(null);
-    setMessages([]);
     setCommand("");
+    setActiveSign(null);
+    if (signTimeoutRef.current) {
+      clearTimeout(signTimeoutRef.current);
+      signTimeoutRef.current = null;
+    }
   }, [clearTimer]);
 
   const sendFrame = useCallback(() => {
@@ -195,20 +198,45 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_SOCKET_URL, onStateUpdat
           setProcessedFrameUrl(data.frame);
         }
 
-        if (data.command) {
-          setCommand(data.command);
-          setHeroAlert(data.command);
+        // Handle command and direction to determine which sign to flash
+        const commandText = data.command ?? "";
+        const rawDirection = data.direction ?? data.position ?? data.lane ?? null;
+        const normalizedDirection = typeof rawDirection === "string" ? rawDirection.toLowerCase() : null;
+        
+        if (commandText) {
+          setCommand(commandText);
+          setHeroAlert(commandText);
+        }
+
+        // Parse command/direction to determine which sign to flash
+        let signToFlash = null;
+        const cmdLower = commandText.toLowerCase();
+        const dirLower = normalizedDirection ?? "";
+        
+        // Check both command and direction fields
+        if (cmdLower.includes("left") || dirLower.includes("left")) {
+          signToFlash = "left";
+        } else if (cmdLower.includes("stop") || cmdLower.includes("halt") || dirLower.includes("stop")) {
+          signToFlash = "stop";
+        } else if (cmdLower.includes("right") || dirLower.includes("right")) {
+          signToFlash = "right";
+        }
+
+        // Flash the sign if detected
+        if (signToFlash) {
+          // Clear any existing timeout
+          if (signTimeoutRef.current) {
+            clearTimeout(signTimeoutRef.current);
+          }
           
-          // Add command to messages
-          setMessages((prev) => [
-            {
-              id: Date.now(),
-              message: data.command,
-              type: "alert",
-              timestamp: new Date().toISOString(),
-            },
-            ...prev.slice(0, 9),
-          ]);
+          setActiveSign(signToFlash);
+          console.log("Flashing sign:", signToFlash, "from command:", commandText, "direction:", normalizedDirection);
+          
+          // Reset active sign after flashing animation (3 seconds)
+          signTimeoutRef.current = setTimeout(() => {
+            setActiveSign(null);
+            signTimeoutRef.current = null;
+          }, 3000);
         }
 
         // Handle detections if present
@@ -235,9 +263,7 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_SOCKET_URL, onStateUpdat
           drawDetections([], processedOverlayCanvasRef, processedVideoRef);
         }
 
-        // Handle direction and speed cues if present
-        const rawDirection = data.direction ?? data.position ?? data.lane ?? null;
-        const normalizedDirection = typeof rawDirection === "string" ? rawDirection.toLowerCase() : null;
+        // Handle speed cues if present
         const rawSpeed = data.speedCue ?? data.speed ?? data.action ?? null;
         const normalizedSpeed = typeof rawSpeed === "string" && rawSpeed.toLowerCase().includes("slow") ? "slow" : null;
 
@@ -328,6 +354,15 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_SOCKET_URL, onStateUpdat
   }, [cameraState, initializeSocket, requestCamera, socketState, socketUrl]);
 
   useEffect(() => () => stopStreaming(), [stopStreaming]);
+
+  useEffect(() => {
+    return () => {
+      if (signTimeoutRef.current) {
+        clearTimeout(signTimeoutRef.current);
+        signTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const canvas = userOverlayCanvasRef.current;
@@ -428,15 +463,40 @@ export function LiveStream({ showToast, wsUrl = DEFAULT_SOCKET_URL, onStateUpdat
         />
       </div>
 
-      {/* Detections and Messages */}
-      <div className="grid gap-6 lg:grid-cols-2">
-        <DetectionsPanel detections={detections} />
-        <MessagesPanel 
-          messages={messages} 
-          directionCue={directionCue}
-          speedCue={speedCue}
-          heroAlert={heroAlert}
-        />
+      {/* Direction Signs */}
+      <div className="flex items-center justify-center gap-8 rounded-2xl border border-white/10 bg-gradient-to-br from-slate-900/80 to-slate-800/60 p-8 backdrop-blur-sm">
+        {/* Left Sign */}
+        <div
+          className={`flex h-24 w-24 items-center justify-center rounded-full border-4 text-4xl font-bold transition-all duration-200 ${
+            activeSign === "left"
+              ? "animate-pulse border-red-500 bg-red-500/30 text-red-300 shadow-2xl shadow-red-500/70 scale-110"
+              : "border-slate-600 bg-slate-800/50 text-slate-500 opacity-50"
+          }`}
+        >
+          ←
+        </div>
+
+        {/* Stop Sign */}
+        <div
+          className={`flex h-24 w-24 items-center justify-center rounded-full border-4 text-4xl font-bold transition-all duration-200 ${
+            activeSign === "stop"
+              ? "animate-pulse border-red-500 bg-red-500/30 text-red-300 shadow-2xl shadow-red-500/70 scale-110"
+              : "border-slate-600 bg-slate-800/50 text-slate-500 opacity-50"
+          }`}
+        >
+          ⏹
+        </div>
+
+        {/* Right Sign */}
+        <div
+          className={`flex h-24 w-24 items-center justify-center rounded-full border-4 text-4xl font-bold transition-all duration-200 ${
+            activeSign === "right"
+              ? "animate-pulse border-red-500 bg-red-500/30 text-red-300 shadow-2xl shadow-red-500/70 scale-110"
+              : "border-slate-600 bg-slate-800/50 text-slate-500 opacity-50"
+          }`}
+        >
+          →
+        </div>
       </div>
 
       <canvas ref={captureCanvasRef} className="hidden" />

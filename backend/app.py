@@ -9,7 +9,7 @@ app = Flask(__name__)
 socketio = SocketIO(app, async_mode='threading', cors_allowed_origins="*")
 
 # Load model once
-model = YOLO("../model/bestn.pt")
+model = YOLO("../model/best_new.pt")
 
 # Shared frame buffer (only latest frame kept)
 latest_frame = None

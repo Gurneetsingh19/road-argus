@@ -55,7 +55,7 @@ function Navbar() {
           <span className="rounded-full bg-slate-900/70 p-2 ring-1 ring-white/10">
             <SparkIcon />
           </span>
-          Vahan Sarthi
+          Road Argus
         </a>
 
         <div className="hidden items-center gap-8 md:flex">
